@@ -904,11 +904,14 @@ training_time_ms = 0
 torch.cuda.synchronize()
 t0 = time.perf_counter()
 
+# Initialize training state
+training_state = TrainingState()
+
 train_steps = args.num_iterations
 for step in range(train_steps + 1):
     last_step = (step == train_steps)
 
-    # Validation
+    # Validation and checkpointing
     if last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0):
         torch.cuda.synchronize()
         training_time_ms += 1000 * (time.perf_counter() - t0)
@@ -926,16 +929,27 @@ for step in range(train_steps + 1):
         val_loss /= val_steps
         del val_loader
         dist.all_reduce(val_loss, op=dist.ReduceOp.AVG)
+        
+        # Check if this is the best model
+        is_best = training_state.update_best(val_loss.item(), step)
+        
         print0(f"step:{step}/{train_steps} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/max(step, 1):.2f}ms", console=True)
+        if is_best:
+            print0(f"New best model! Previous best: {training_state.best_val_loss:.4f}")
+        
+        # Save checkpoints
+        if args.save_checkpoint and (training_state.should_save_checkpoint(step) or is_best or last_step):
+            save_checkpoint(model, optimizers, step, val_loss.item(), run_id, is_best, model_config)
+            training_state.last_save_step = step
+        
         model.train()
         torch.cuda.synchronize()
         t0 = time.perf_counter()
 
     if last_step:
-        if master_process and args.save_checkpoint:
-            log = dict(step=step, code=code, model=model.state_dict(), optimizers=[opt.state_dict() for opt in optimizers])
-            os.makedirs(f"logs/{run_id}", exist_ok=True)
-            torch.save(log, f"logs/{run_id}/state_step{step:06d}.pt")
+        # Final model save
+        if master_process and args.save_final_model:
+            save_checkpoint(model, optimizers, step, training_state.best_val_loss, run_id, False, model_config)
         break
 
     # Training step
@@ -962,7 +976,8 @@ for step in range(train_steps + 1):
         model.reset_states()
     
     approx_training_time_ms = training_time_ms + 1000 * (time.perf_counter() - t0)
-    print0(f"step:{step+1}/{train_steps} train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms/(step + 1):.2f}ms", console=True)
+    if step % 10 == 0:  # Less frequent logging
+        print0(f"step:{step+1}/{train_steps} train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms/(step + 1):.2f}ms", console=True)
 
 print0(f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
        f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB", console=True)
